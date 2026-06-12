@@ -1,0 +1,6 @@
+.env
+bot_data.db
+prune_log.txt
+__pycache__/
+*.pyc
+.venv/
