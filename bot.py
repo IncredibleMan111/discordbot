@@ -157,7 +157,7 @@ RD_RANKS = [
     "Recruitment Prospect",
     "Recruitment Officer",
     "Senior Recruitment Officer",
-    "Recruitment Manager",
+    "Lead Recruiter",
     "Director of Recruitment",
 ]
 
