@@ -170,6 +170,37 @@ def get_rd_rank_index(member):
             idx = i
     return idx
 
+async def resolve_member(ctx, query):
+    """Resolve a member from a mention, ID, or username. Works in guilds and DMs."""
+    query = query.strip()
+    # Strip mention formatting like <@123> or <@!123>
+    if query.startswith("<@") and query.endswith(">"):
+        query = query[2:-1].lstrip("!")
+
+    # Candidate guilds: the command's guild, otherwise every guild the bot is in
+    guilds = [ctx.guild] if ctx.guild else list(bot.guilds)
+
+    # Try by ID first
+    if query.isdigit():
+        uid = int(query)
+        for g in guilds:
+            m = g.get_member(uid)
+            if m:
+                return m
+
+    lowered = query.lower()
+    # Exact name / display name / full tag match
+    for g in guilds:
+        for m in g.members:
+            if lowered in (m.name.lower(), m.display_name.lower(), str(m).lower()):
+                return m
+    # Partial match fallback
+    for g in guilds:
+        for m in g.members:
+            if lowered in m.name.lower() or lowered in m.display_name.lower():
+                return m
+    return None
+
 # ---------------------------------------------------------
 # COMMAND: &&inactivityprune
 # ---------------------------------------------------------
@@ -1005,14 +1036,101 @@ RDF_MESSAGE = (
     "Thank you for your interest in helping Secret grow."
 )
 
+RD_APPLICATION_FORM = (
+    "# Secret Recruitment Division Application\n\n"
+    "Thank you for your interest in joining the Secret Recruitment Division. Please answer all questions honestly and with effort.\n\n"
+    "**1. Roblox Username**\n\n"
+    "**2. Discord Username**\n\n"
+    "**3. How active are you on Roblox and Discord?**\n\n"
+    "**4. Why do you want to join the Recruitment Division?**\n\n"
+    "**5. If accepted, how would you recruit active players to Secret? Be specific.**\n\n"
+    "**6. Have you ever recruited, staffed, moderated, or helped grow a community before? If so, explain.**\n\n"
+    "**7. What makes a recruit valuable to Secret besides simply joining the group?**\n\n"
+    "**8. If another recruiter was submitting fake recruits to gain rewards, what would you do?**\n\n"
+    "**9. How many active recruits do you realistically believe you could bring to Secret each week?**\n\n"
+    "**10. Why should we choose you over other applicants?**\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "By submitting this application, you confirm that:\n\n"
+    "• You understand that fake recruit submissions will result in removal from the Recruitment Division.\n"
+    "• You understand that recruit quality is more important than recruit quantity.\n"
+    "• You understand that all recruits must be verified before they count toward rewards or promotions.\n"
+    "• You understand that Recruitment Prospects must complete a 3-day trial period and recruit 3 verified members before promotion.\n\n"
+    "Reply to this message with your completed application."
+)
 
-@bot.command(name="RDA", help="Accept a recruitment applicant. Usage: &&RDA @user")
-async def rda(ctx: commands.Context, member: discord.Member):
-    if not is_staff(ctx.author):
-        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+
+@bot.command(name="RDApply", help="Apply to the Recruitment Division. The bot will DM you the form.")
+async def rdapply(ctx: commands.Context):
+    # Determine which guild's owner should receive the application
+    guild = ctx.guild
+    if guild is None:
+        mutual = [g for g in bot.guilds if g.get_member(ctx.author.id)]
+        guild = mutual[0] if mutual else None
+
+    try:
+        dm = await ctx.author.create_dm()
+        await dm.send(RD_APPLICATION_FORM)
+    except discord.Forbidden:
+        await ctx.send("❌ I couldn't DM you. Enable **Direct Messages** from server members and try again.")
         return
 
-    prospect_role = get_role_by_name(ctx.guild, "Recruitment Prospect")
+    if ctx.guild:
+        await ctx.send(f"📨 {ctx.author.mention}, check your DMs for the application form!")
+
+    def check(m):
+        return m.author.id == ctx.author.id and isinstance(m.channel, discord.DMChannel)
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=86400)  # 24 hours
+    except asyncio.TimeoutError:
+        try:
+            await dm.send("⏰ Your application timed out. Run `&&RDApply` again whenever you're ready.")
+        except discord.Forbidden:
+            pass
+        return
+
+    owner = guild.owner if guild else None
+    if not owner:
+        await dm.send("⚠️ Application received, but I couldn't locate the server owner to forward it to.")
+        return
+
+    header = (
+        f"📥 **New RD Application**\n"
+        f"Applicant: {ctx.author.mention} ({ctx.author} | `{ctx.author.id}`)\n"
+        f"Accept: `&&RDA {ctx.author.id}`   |   Deny: `&&RDF {ctx.author.id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    body = reply.content if reply.content else "(no text submitted)"
+    full = header + body
+
+    try:
+        # Split into <=1900 char chunks to respect Discord's message limit
+        for i in range(0, len(full), 1900):
+            await owner.send(full[i:i + 1900])
+        await dm.send("✅ Your application has been submitted! You'll be notified of the decision.")
+    except discord.Forbidden:
+        await dm.send("⚠️ Application received, but I couldn't DM the server owner.")
+
+
+async def _check_rd_permission(ctx, member):
+    """Confirm the command author is STAFF+ in the target member's guild. Works in DMs."""
+    author_member = member.guild.get_member(ctx.author.id)
+    if not author_member or not is_staff(author_member):
+        await ctx.send("❌ You need the STAFF role or higher (in the server) to use this command.")
+        return False
+    return True
+
+
+@bot.command(name="RDA", help="Accept a recruitment applicant. Usage: &&RDA @user OR &&RDA username")
+async def rda(ctx: commands.Context, *, query: str):
+    member = await resolve_member(ctx, query)
+    if not member:
+        await ctx.send("❌ Could not find that user. Try using their ID.")
+        return
+    if not await _check_rd_permission(ctx, member):
+        return
+
+    prospect_role = get_role_by_name(member.guild, "Recruitment Prospect")
     if not prospect_role:
         await ctx.send("❌ The `Recruitment Prospect` role does not exist.")
         return
@@ -1030,13 +1148,16 @@ async def rda(ctx: commands.Context, member: discord.Member):
         dm_ok = False
 
     note = "" if dm_ok else " (could not DM the user — they may have DMs disabled)"
-    await ctx.send(f"✅ {member.mention} accepted and given `Recruitment Prospect`.{note}")
+    await ctx.send(f"✅ {member} accepted and given `Recruitment Prospect`.{note}")
 
 
-@bot.command(name="RDF", help="Deny a recruitment applicant. Usage: &&RDF @user")
-async def rdf(ctx: commands.Context, member: discord.Member):
-    if not is_staff(ctx.author):
-        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+@bot.command(name="RDF", help="Deny a recruitment applicant. Usage: &&RDF @user OR &&RDF username")
+async def rdf(ctx: commands.Context, *, query: str):
+    member = await resolve_member(ctx, query)
+    if not member:
+        await ctx.send("❌ Could not find that user. Try using their ID.")
+        return
+    if not await _check_rd_permission(ctx, member):
         return
 
     dm_ok = True
@@ -1046,9 +1167,9 @@ async def rdf(ctx: commands.Context, member: discord.Member):
         dm_ok = False
 
     if dm_ok:
-        await ctx.send(f"✅ {member.mention} has been sent a denial notice.")
+        await ctx.send(f"✅ {member} has been sent a denial notice.")
     else:
-        await ctx.send(f"⚠️ Could not DM {member.mention} (they may have DMs disabled).")
+        await ctx.send(f"⚠️ Could not DM {member} (they may have DMs disabled).")
 
 
 @bot.command(name="RDPromo", help="Promote within the Recruitment Division. Usage: &&RDPromo @user")
