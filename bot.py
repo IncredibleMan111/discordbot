@@ -44,7 +44,9 @@ class PruneBot(commands.Bot):
             guild_id INTEGER,
             reason TEXT,
             timestamp TEXT,
-            moderator_id INTEGER
+            moderator_id INTEGER,
+            log_channel_id INTEGER,
+            log_message_id INTEGER
         )''')
         c.execute('''CREATE TABLE IF NOT EXISTS tempbans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +54,20 @@ class PruneBot(commands.Bot):
             guild_id INTEGER,
             expiry_timestamp TEXT
         )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            guild_id INTEGER,
+            reason TEXT,
+            timestamp TEXT,
+            moderator_id INTEGER
+        )''')
+        # Lightweight migration: add log columns to old strikes tables
+        for col in ("log_channel_id", "log_message_id"):
+            try:
+                c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
         conn.close()
 
@@ -120,6 +136,40 @@ def can_demote_target(author, target_role):
 def get_log_channel(guild, name):
     return discord.utils.get(guild.text_channels, name=name)
 
+def parse_duration(text):
+    """Parse a duration string like '4h', '30m', '7d', '90s' into a timedelta. Returns None if invalid."""
+    if not text:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    unit = text[-1].lower()
+    if unit not in units:
+        return None
+    try:
+        amount = int(text[:-1])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return datetime.timedelta(seconds=amount * units[unit])
+
+# Recruitment Division rank ladder (lowest to highest)
+RD_RANKS = [
+    "Recruitment Prospect",
+    "Recruitment Officer",
+    "Senior Recruitment Officer",
+    "Recruitment Manager",
+    "Director of Recruitment",
+]
+
+def get_rd_rank_index(member):
+    """Return the index of the member's highest RD rank, or -1 if none."""
+    idx = -1
+    for i, name in enumerate(RD_RANKS):
+        role = get_role_by_name(member.guild, name)
+        if role and role in member.roles:
+            idx = i
+    return idx
+
 # ---------------------------------------------------------
 # COMMAND: &&inactivityprune
 # ---------------------------------------------------------
@@ -177,6 +227,9 @@ async def inactivityprune(ctx: commands.Context):
     inactive_members = []
     preview_lines = []
     
+    # Members who joined within the last 3 days are too new to count as inactive
+    join_grace_cutoff = discord.utils.utcnow() - datetime.timedelta(days=3)
+
     # Determine which members are inactive
     for member in guild.members:
         if member.bot or member == guild.owner:
@@ -184,6 +237,9 @@ async def inactivityprune(ctx: commands.Context):
         if exclude_role_dot and exclude_role_dot in member.roles:
             continue
         if exclude_role_outsider and exclude_role_outsider in member.roles:
+            continue
+        # Skip members who joined in the last 3 days
+        if member.joined_at and member.joined_at > join_grace_cutoff:
             continue
             
         last_msg_date = last_message_dates.get(member.id)
@@ -412,6 +468,7 @@ async def strike(ctx: commands.Context, member: discord.Member, *, reason: str):
     c.execute("INSERT INTO strikes (user_id, guild_id, reason, timestamp, moderator_id) VALUES (?, ?, ?, ?, ?)",
               (member.id, ctx.guild.id, reason, now, ctx.author.id))
     conn.commit()
+    strike_id = c.lastrowid
     c.execute("SELECT COUNT(*) FROM strikes WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
     count = c.fetchone()[0]
     conn.close()
@@ -425,11 +482,18 @@ async def strike(ctx: commands.Context, member: discord.Member, *, reason: str):
 
     log_ch = get_log_channel(ctx.guild, "punishment-logs")
     if log_ch:
-        await log_ch.send(
+        log_msg = await log_ch.send(
             f"user; <@{member.id}>\n"
             f"strike; {count}/3\n"
             f"reason; {reason}"
         )
+        # Save the log message so &&removestrike can reply "Reverted" to it
+        conn = sqlite3.connect(bot.db_path)
+        c = conn.cursor()
+        c.execute("UPDATE strikes SET log_channel_id = ?, log_message_id = ? WHERE id = ?",
+                  (log_ch.id, log_msg.id, strike_id))
+        conn.commit()
+        conn.close()
 
     if count >= 3:
         expiry = (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat()
@@ -483,20 +547,42 @@ async def removestrike(ctx: commands.Context, member: discord.Member):
 
     conn = sqlite3.connect(bot.db_path)
     c = conn.cursor()
-    c.execute("SELECT id FROM strikes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC LIMIT 1", (member.id, ctx.guild.id))
+    c.execute("SELECT id, reason, log_channel_id, log_message_id FROM strikes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC LIMIT 1", (member.id, ctx.guild.id))
     row = c.fetchone()
     if not row:
         conn.close()
         await ctx.send("❌ No strikes found for this user.")
         return
 
-    c.execute("DELETE FROM strikes WHERE id = ?", (row[0],))
+    strike_id, reason, log_channel_id, log_message_id = row
+    c.execute("DELETE FROM strikes WHERE id = ?", (strike_id,))
     conn.commit()
     c.execute("SELECT COUNT(*) FROM strikes WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
     count = c.fetchone()[0]
     conn.close()
 
     await ctx.send(f"✅ Removed 1 strike from {member.mention}. Current strikes: {count}/3.")
+
+    # Reply "Reverted" to the original strike log message
+    if log_channel_id and log_message_id:
+        try:
+            log_ch = ctx.guild.get_channel(log_channel_id)
+            if log_ch:
+                original = await log_ch.fetch_message(log_message_id)
+                await original.reply("Reverted")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # DM the server owner
+    try:
+        owner = ctx.guild.owner
+        if owner:
+            await owner.send(
+                f"♻️ **Strike Reverted**\nUser: {member.mention} ({member.name})\n"
+                f"Reverted reason: {reason}\nModerator: {ctx.author.name}\nStrike count now: {count}/3"
+            )
+    except discord.Forbidden:
+        pass
 
 
 # ---------------------------------------------------------
@@ -554,28 +640,518 @@ async def kick(ctx: commands.Context, member: discord.Member, *, reason: str = "
 # ---------------------------------------------------------
 # COMMAND: &&mute
 # ---------------------------------------------------------
-@bot.command(name="mute", help="Timeout/mute a user for 1 hour. Usage: &&mute @user reason")
-async def mute(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+@bot.command(name="mute", help="Timeout a user for a duration. Usage: &&mute @user 4h spamming")
+async def mute(ctx: commands.Context, member: discord.Member, duration: str = "1h", *, reason: str = "No reason provided"):
     if not is_staff(ctx.author):
         await ctx.send("❌ You need the STAFF role or higher to use this command.")
         return
 
-    duration = datetime.timedelta(hours=1)
+    delta = parse_duration(duration)
+    if delta is None:
+        # Treat the would-be duration as part of the reason and default to 1 hour
+        reason = (duration + " " + reason).strip() if reason != "No reason provided" else duration
+        delta = datetime.timedelta(hours=1)
+        duration_label = "1h"
+    else:
+        duration_label = duration
+
+    if delta > datetime.timedelta(days=28):
+        await ctx.send("❌ Discord timeouts cannot exceed 28 days.")
+        return
+
     try:
-        await member.timeout(duration, reason=f"Muted by {ctx.author.name}: {reason}")
-        await ctx.send(f"🔇 Muted {member.mention} for 1 hour. Reason: `{reason}`")
+        await member.timeout(delta, reason=f"Muted by {ctx.author.name}: {reason}")
+        await ctx.send(f"🔇 Muted {member.mention} for `{duration_label}`. Reason: `{reason}`")
 
         log_ch = get_log_channel(ctx.guild, "punishment-logs")
         if log_ch:
             await log_ch.send(
                 f"user; <@{member.id}>\n"
-                f"action; mute (1 hour)\n"
+                f"action; mute ({duration_label})\n"
                 f"reason; {reason}"
             )
     except discord.Forbidden:
         await ctx.send("❌ Missing permissions to timeout.")
     except discord.HTTPException as e:
         await ctx.send(f"❌ Error: {str(e)}")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&unmute
+# ---------------------------------------------------------
+@bot.command(name="unmute", help="Remove a timeout from a user. Usage: &&unmute @user")
+async def unmute(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    try:
+        await member.timeout(None, reason=f"Unmuted by {ctx.author.name}: {reason}")
+        await ctx.send(f"🔊 Unmuted {member.mention}.")
+
+        log_ch = get_log_channel(ctx.guild, "punishment-logs")
+        if log_ch:
+            await log_ch.send(
+                f"user; <@{member.id}>\n"
+                f"action; unmute\n"
+                f"reason; {reason}"
+            )
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to remove timeout.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&unban
+# ---------------------------------------------------------
+@bot.command(name="unban", help="Unban a user by ID. Usage: &&unban <user_id>")
+async def unban(ctx: commands.Context, user_id: int, *, reason: str = "No reason provided"):
+    if not is_overseer(ctx.author):
+        await ctx.send("❌ You need the Overseer role or higher to use this command.")
+        return
+
+    try:
+        user = await bot.fetch_user(user_id)
+        await ctx.guild.unban(user, reason=f"Unbanned by {ctx.author.name}: {reason}")
+        await ctx.send(f"✅ Unbanned `{user}`.")
+
+        log_ch = get_log_channel(ctx.guild, "punishment-logs")
+        if log_ch:
+            await log_ch.send(
+                f"user; <@{user_id}>\n"
+                f"action; unban\n"
+                f"reason; {reason}"
+            )
+    except discord.NotFound:
+        await ctx.send("❌ That user is not banned or does not exist.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to unban.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&warn / &&warnings / &&clearwarnings
+# ---------------------------------------------------------
+@bot.command(name="warn", help="Warn a user. Usage: &&warn @user reason")
+async def warn(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    now = datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect(bot.db_path)
+    c = conn.cursor()
+    c.execute("INSERT INTO warnings (user_id, guild_id, reason, timestamp, moderator_id) VALUES (?, ?, ?, ?, ?)",
+              (member.id, ctx.guild.id, reason, now, ctx.author.id))
+    conn.commit()
+    c.execute("SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
+    count = c.fetchone()[0]
+    conn.close()
+
+    await ctx.send(f"⚠️ Warned {member.mention}. Reason: `{reason}`. Total warnings: {count}.")
+    try:
+        await member.send(f"You have been warned in **{ctx.guild.name}**.\nReason: {reason}")
+    except discord.Forbidden:
+        pass
+
+    log_ch = get_log_channel(ctx.guild, "punishment-logs")
+    if log_ch:
+        await log_ch.send(
+            f"user; <@{member.id}>\n"
+            f"action; warn (#{count})\n"
+            f"reason; {reason}"
+        )
+
+
+@bot.command(name="warnings", help="List a user's warnings. Usage: &&warnings @user")
+async def warnings(ctx: commands.Context, member: discord.Member):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    conn = sqlite3.connect(bot.db_path)
+    c = conn.cursor()
+    c.execute("SELECT reason, timestamp FROM warnings WHERE user_id = ? AND guild_id = ? ORDER BY id ASC", (member.id, ctx.guild.id))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await ctx.send(f"{member.mention} has no warnings.")
+        return
+
+    lines = [f"**Warnings for {member.name}:**"]
+    for i, (reason, ts) in enumerate(rows, start=1):
+        lines.append(f"{i}. {reason} — `{ts[:10]}`")
+    await ctx.send("\n".join(lines)[:1900])
+
+
+@bot.command(name="clearwarnings", help="Clear all warnings for a user. Usage: &&clearwarnings @user")
+async def clearwarnings(ctx: commands.Context, member: discord.Member):
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the Admin role or higher to use this command.")
+        return
+
+    conn = sqlite3.connect(bot.db_path)
+    c = conn.cursor()
+    c.execute("DELETE FROM warnings WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
+    conn.commit()
+    conn.close()
+    await ctx.send(f"✅ Cleared all warnings for {member.mention}.")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&purge / &&clear
+# ---------------------------------------------------------
+@bot.command(name="purge", aliases=["clear"], help="Bulk delete messages. Usage: &&purge 20")
+async def purge(ctx: commands.Context, amount: int):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+    if amount < 1 or amount > 1000:
+        await ctx.send("❌ Provide a number between 1 and 1000.")
+        return
+    try:
+        deleted = await ctx.channel.purge(limit=amount + 1)
+        msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
+        await asyncio.sleep(3)
+        await msg.delete()
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to manage messages.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Error: {str(e)}")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&slowmode
+# ---------------------------------------------------------
+@bot.command(name="slowmode", help="Set channel slowmode in seconds. Usage: &&slowmode 10")
+async def slowmode(ctx: commands.Context, seconds: int):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+    if seconds < 0 or seconds > 21600:
+        await ctx.send("❌ Slowmode must be between 0 and 21600 seconds.")
+        return
+    try:
+        await ctx.channel.edit(slowmode_delay=seconds)
+        if seconds == 0:
+            await ctx.send("✅ Slowmode disabled.")
+        else:
+            await ctx.send(f"🐌 Slowmode set to {seconds} seconds.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to edit the channel.")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&lock / &&unlock
+# ---------------------------------------------------------
+@bot.command(name="lock", help="Lock the current channel. Usage: &&lock")
+async def lock(ctx: commands.Context):
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the Admin role or higher to use this command.")
+        return
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = False
+    try:
+        await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+        await ctx.send("🔒 Channel locked.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to edit the channel.")
+
+
+@bot.command(name="unlock", help="Unlock the current channel. Usage: &&unlock")
+async def unlock(ctx: commands.Context):
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the Admin role or higher to use this command.")
+        return
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    overwrite.send_messages = None
+    try:
+        await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+        await ctx.send("🔓 Channel unlocked.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to edit the channel.")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&nick
+# ---------------------------------------------------------
+@bot.command(name="nick", help="Change a user's nickname. Usage: &&nick @user new name")
+async def nick(ctx: commands.Context, member: discord.Member, *, nickname: str = None):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+    try:
+        await member.edit(nick=nickname)
+        if nickname:
+            await ctx.send(f"✅ Changed {member.mention}'s nickname to `{nickname}`.")
+        else:
+            await ctx.send(f"✅ Reset {member.mention}'s nickname.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to change that nickname.")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&role (add/remove a role)
+# ---------------------------------------------------------
+@bot.command(name="role", help="Toggle a role on a user. Usage: &&role @user RoleName")
+async def role(ctx: commands.Context, member: discord.Member, *, role_name: str):
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the Admin role or higher to use this command.")
+        return
+    target = get_role_by_name(ctx.guild, role_name)
+    if not target:
+        await ctx.send(f"❌ Role `{role_name}` not found.")
+        return
+    try:
+        if target in member.roles:
+            await member.remove_roles(target, reason=f"By {ctx.author.name}")
+            await ctx.send(f"✅ Removed `{target.name}` from {member.mention}.")
+        else:
+            await member.add_roles(target, reason=f"By {ctx.author.name}")
+            await ctx.send(f"✅ Added `{target.name}` to {member.mention}.")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions or role hierarchy too low.")
+
+
+# ---------------------------------------------------------
+# COMMAND: &&say / &&announce
+# ---------------------------------------------------------
+@bot.command(name="say", help="Make the bot say something. Usage: &&say message")
+async def say(ctx: commands.Context, *, message: str):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    await ctx.send(message)
+
+
+@bot.command(name="announce", help="Send an announcement embed. Usage: &&announce message")
+async def announce(ctx: commands.Context, *, message: str):
+    if not is_admin(ctx.author):
+        await ctx.send("❌ You need the Admin role or higher to use this command.")
+        return
+    embed = discord.Embed(description=message, color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
+    embed.set_author(name=f"Announcement from {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+# ---------------------------------------------------------
+# COMMAND: &&userinfo / &&serverinfo / &&avatar
+# ---------------------------------------------------------
+@bot.command(name="userinfo", aliases=["whois"], help="Show info about a user. Usage: &&userinfo @user")
+async def userinfo(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    embed = discord.Embed(title=f"User Info — {member}", color=member.color, timestamp=discord.utils.utcnow())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID", value=member.id, inline=False)
+    embed.add_field(name="Joined", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown", inline=True)
+    embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name=f"Roles ({len(roles)})", value=" ".join(roles) if roles else "None", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="serverinfo", help="Show info about the server. Usage: &&serverinfo")
+async def serverinfo(ctx: commands.Context):
+    guild = ctx.guild
+    embed = discord.Embed(title=f"Server Info — {guild.name}", color=discord.Color.green(), timestamp=discord.utils.utcnow())
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="Owner", value=str(guild.owner), inline=True)
+    embed.add_field(name="Members", value=guild.member_count, inline=True)
+    embed.add_field(name="Roles", value=len(guild.roles), inline=True)
+    embed.add_field(name="Channels", value=len(guild.channels), inline=True)
+    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="ID", value=guild.id, inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="avatar", aliases=["av"], help="Show a user's avatar. Usage: &&avatar @user")
+async def avatar(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"{member.display_name}'s avatar", color=member.color)
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="ping", help="Check the bot's latency.")
+async def ping(ctx: commands.Context):
+    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+
+
+# ---------------------------------------------------------
+# RECRUITMENT DIVISION COMMANDS
+# ---------------------------------------------------------
+RDA_MESSAGE = (
+    "Congratulations! Your application has been accepted.\n\n"
+    "You have been assigned the Recruitment Prospect rank and are now a member of the Secret Recruitment Division.\n\n"
+    "To be promoted to Recruitment Officer, you must:\n\n"
+    "• Complete your 3-day trial period\n"
+    "• Recruit 3 verified members\n\n"
+    "Please review the Recruitment Handbook and Recruitment SOP before beginning.\n\n"
+    "Good luck."
+)
+
+RDF_MESSAGE = (
+    "Thank you for applying to the Secret Recruitment Division.\n\n"
+    "After reviewing your application, we have decided not to move forward with it at this time.\n\n"
+    "This is not necessarily a permanent denial. You may reapply in the future as activity and department needs change.\n\n"
+    "Thank you for your interest in helping Secret grow."
+)
+
+
+@bot.command(name="RDA", help="Accept a recruitment applicant. Usage: &&RDA @user")
+async def rda(ctx: commands.Context, member: discord.Member):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    prospect_role = get_role_by_name(ctx.guild, "Recruitment Prospect")
+    if not prospect_role:
+        await ctx.send("❌ The `Recruitment Prospect` role does not exist.")
+        return
+
+    try:
+        await member.add_roles(prospect_role, reason=f"RD accepted by {ctx.author.name}")
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions to assign the Recruitment Prospect role.")
+        return
+
+    dm_ok = True
+    try:
+        await member.send(RDA_MESSAGE)
+    except discord.Forbidden:
+        dm_ok = False
+
+    note = "" if dm_ok else " (could not DM the user — they may have DMs disabled)"
+    await ctx.send(f"✅ {member.mention} accepted and given `Recruitment Prospect`.{note}")
+
+
+@bot.command(name="RDF", help="Deny a recruitment applicant. Usage: &&RDF @user")
+async def rdf(ctx: commands.Context, member: discord.Member):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    dm_ok = True
+    try:
+        await member.send(RDF_MESSAGE)
+    except discord.Forbidden:
+        dm_ok = False
+
+    if dm_ok:
+        await ctx.send(f"✅ {member.mention} has been sent a denial notice.")
+    else:
+        await ctx.send(f"⚠️ Could not DM {member.mention} (they may have DMs disabled).")
+
+
+@bot.command(name="RDPromo", help="Promote within the Recruitment Division. Usage: &&RDPromo @user")
+async def rdpromo(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    idx = get_rd_rank_index(member)
+    if idx == -1:
+        await ctx.send("❌ That user is not in the Recruitment Division (no RD rank).")
+        return
+    if idx >= len(RD_RANKS) - 1:
+        await ctx.send("❌ That user is already at the highest RD rank (Director of Recruitment).")
+        return
+
+    # Find the next existing rank above the current one
+    next_idx = None
+    for i in range(idx + 1, len(RD_RANKS)):
+        if get_role_by_name(ctx.guild, RD_RANKS[i]):
+            next_idx = i
+            break
+    if next_idx is None:
+        await ctx.send("❌ No higher RD rank role exists in this server.")
+        return
+
+    old_role = get_role_by_name(ctx.guild, RD_RANKS[idx])
+    new_role = get_role_by_name(ctx.guild, RD_RANKS[next_idx])
+    try:
+        if old_role:
+            await member.remove_roles(old_role, reason=f"RD promo by {ctx.author.name}")
+        await member.add_roles(new_role, reason=f"RD promo by {ctx.author.name}: {reason}")
+        await ctx.send(f"✅ Promoted {member.mention} from `{RD_RANKS[idx]}` to `{RD_RANKS[next_idx]}`.")
+
+        log_ch = get_log_channel(ctx.guild, "promo-logs")
+        if log_ch:
+            await log_ch.send(
+                f"user; <@{member.id}>\n"
+                f"RD promotion; {RD_RANKS[idx]} / {RD_RANKS[next_idx]}\n"
+                f"reason; {reason}"
+            )
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions or role hierarchy too low.")
+
+
+@bot.command(name="RDDemote", help="Demote within the Recruitment Division. Usage: &&RDDemote @user")
+async def rddemote(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ You need the STAFF role or higher to use this command.")
+        return
+
+    idx = get_rd_rank_index(member)
+    if idx == -1:
+        await ctx.send("❌ That user is not in the Recruitment Division (no RD rank).")
+        return
+    if idx == 0:
+        await ctx.send("❌ That user is already at the lowest RD rank (Recruitment Prospect).")
+        return
+
+    # Find the next existing rank below the current one
+    prev_idx = None
+    for i in range(idx - 1, -1, -1):
+        if get_role_by_name(ctx.guild, RD_RANKS[i]):
+            prev_idx = i
+            break
+    if prev_idx is None:
+        await ctx.send("❌ No lower RD rank role exists in this server.")
+        return
+
+    old_role = get_role_by_name(ctx.guild, RD_RANKS[idx])
+    new_role = get_role_by_name(ctx.guild, RD_RANKS[prev_idx])
+    try:
+        if old_role:
+            await member.remove_roles(old_role, reason=f"RD demote by {ctx.author.name}")
+        await member.add_roles(new_role, reason=f"RD demote by {ctx.author.name}: {reason}")
+        await ctx.send(f"✅ Demoted {member.mention} from `{RD_RANKS[idx]}` to `{RD_RANKS[prev_idx]}`.")
+
+        log_ch = get_log_channel(ctx.guild, "punishment-logs")
+        if log_ch:
+            await log_ch.send(
+                f"user; <@{member.id}>\n"
+                f"RD demotion; {RD_RANKS[idx]} / {RD_RANKS[prev_idx]}\n"
+                f"reason; {reason}"
+            )
+    except discord.Forbidden:
+        await ctx.send("❌ Missing permissions or role hierarchy too low.")
+
+
+# ---------------------------------------------------------
+# ERROR HANDLER
+# ---------------------------------------------------------
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: `{error.param.name}`. Check `&&help {ctx.command}`.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Invalid argument. Make sure you mentioned a valid user/value.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Could not find that member.")
+    elif isinstance(error, commands.CommandNotFound):
+        pass
+    else:
+        await ctx.send(f"❌ Error: {str(error)}")
 
 
 # Run the bot
